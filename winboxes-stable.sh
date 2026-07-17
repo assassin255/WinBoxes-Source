@@ -2941,12 +2941,16 @@ case "$main_choice" in
     echo -e "${C}🗑️  ===== XOÁ VM =====${W}"
     BUILD="${BUILD:-/tmp/qemu-build}"
     IMG_LIST=(); IMG_LABEL=()
+    declare -A _SEEN_REAL=()
     for _p in \
         "$BUILD/win.img" "/tmp/qemu-build/win.img" "$HOME/win.img" \
         "/content/win.img" "$(pwd)/win.img" \
         "$BUILD/2012.img" "$BUILD/2022.img" \
         "/tmp/qemu-build/2012.img" "/tmp/qemu-build/2022.img"; do
         if [[ -f "$_p" ]]; then
+            _real=$(realpath "$_p" 2>/dev/null || echo "$_p")
+            [[ -n "${_SEEN_REAL[$_real]:-}" ]] && continue
+            _SEEN_REAL[$_real]=1
             SIZE=$(du -sh "$_p" 2>/dev/null | cut -f1 || echo "?")
             IMG_LIST+=("$_p"); IMG_LABEL+=("$_p  [${SIZE}]")
         fi
