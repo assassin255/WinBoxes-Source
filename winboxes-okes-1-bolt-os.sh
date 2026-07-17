@@ -313,13 +313,15 @@ _bolt_find_tool() {
 }
 
 _bolt_check_tools() {
+    # LLVM BOLT chỉ được bật khi người dùng truyền cờ --llvm-bolt (BOLT_MODE=1)
+    # Không còn tự động kích hoạt chỉ vì có sẵn công cụ trên máy.
+    [[ "${BOLT_MODE:-0}" == "1" ]] || return 1
     # Chỉ kích hoạt BOLT ở root mode, có apt
     [[ "$APT_OK" != "1" ]] && return 1
     # LLVM BOLT KHÔNG bao giờ dùng trong rootless mode
     [[ "$ROOTLESS" == "1" ]] && return 1
     # Tắt BOLT bằng biến môi trường
     [[ "${NO_BOLT:-0}" == "1" ]] && return 1
-    # BOLT tự động kích hoạt khi đủ điều kiện (root + có llvm-bolt)
     # Kiểm tra llvm-bolt binary — bất kỳ version nào trong BOLT_LLVM_VERSIONS
     # hoặc phát hiện được qua quét PATH
     [[ -n "$(_bolt_find_tool llvm-bolt)" ]] || return 1
@@ -757,7 +759,7 @@ for _arg in "$@"; do
         --build|--rebuild) AUTO_BUILD="yes" ;;
         --no-build)   AUTO_BUILD="no"  ;;
         --pgo)         PGO_MODE=1 ;;
-        --bolt)        BOLT_MODE=1 ;;
+        --llvm-bolt|--bolt) BOLT_MODE=1 ;;
         --http-img|--no-download) USE_HTTP_BACKEND=1 ;;
         --safe-download) SAFE_DOWNLOAD=1 ;;
         --id=*)       INSTANCE_ID="${_arg#--id=}" ;;
@@ -789,8 +791,8 @@ for _arg in "$@"; do
             echo "  --rebuild       Alias của --build"
             echo "  --no-build      Bỏ qua build QEMU"
             echo "  --pgo           Bật PGO train/use flow và lưu profile theo từng Windows OS"
-            echo "  --bolt          Bật LLVM BOLT optimization (tự động theo OS, root mode)"
-            echo "  NO_BOLT=1       Tắt LLVM BOLT optimization"
+            echo "  --llvm-bolt     Bật LLVM BOLT optimization (mặc định TẮT, cần root mode)"
+            echo "  NO_BOLT=1       Tắt LLVM BOLT optimization (dù có --llvm-bolt)"
             echo "  --id=N          Multi-VM: instance id (RDP port=3388+N, default N=1)"
             echo "  --port-forward=H:G  Thêm hostfwd TCP (vd: --port-forward=8080:80)"
             echo "  --status        Xem thông tin VM đang chạy"
@@ -3289,28 +3291,30 @@ if [[ "$choice" == "y" ]]; then
         done
         _rl_ok "apt deps xong"
 
-        # ── LLVM BOLT: thử cài lần lượt nhiều version (mới → cũ) ──────
+        # ── LLVM BOLT: chỉ dò/cài khi người dùng bật --llvm-bolt ──────
         # Trước đây khoá cứng "bolt-20", giờ dò theo BOLT_LLVM_VERSIONS
         # để tương thích với các bản Ubuntu/Debian không có bolt-20
         # (ví dụ chỉ có bolt-18 hoặc bolt-21 tuỳ repo).
-        if [[ -z "$(_bolt_find_tool llvm-bolt 2>/dev/null)" ]]; then
-            echo -e "${B}ℹ${W}  Dò tìm gói LLVM BOLT khả dụng (thử ${BOLT_LLVM_VERSIONS[*]})..."
-            for _bv in "${BOLT_LLVM_VERSIONS[@]}"; do
-                if command -v "llvm-bolt-${_bv}" &>/dev/null; then
-                    _rl_ok "Đã có llvm-bolt-${_bv}"
-                    break
-                fi
-                apt_install "bolt-${_bv}" &>/dev/null || true
-                if command -v "llvm-bolt-${_bv}" &>/dev/null; then
-                    _rl_ok "Cài đặt thành công: bolt-${_bv} (llvm-bolt-${_bv})"
-                    break
-                fi
-            done
+        if [[ "${BOLT_MODE:-0}" == "1" ]]; then
             if [[ -z "$(_bolt_find_tool llvm-bolt 2>/dev/null)" ]]; then
-                _rl_warn "Không tìm/cài được gói LLVM BOLT (đã thử: ${BOLT_LLVM_VERSIONS[*]}) — BOLT sẽ bị bỏ qua"
+                echo -e "${B}ℹ${W}  Dò tìm gói LLVM BOLT khả dụng (thử ${BOLT_LLVM_VERSIONS[*]})..."
+                for _bv in "${BOLT_LLVM_VERSIONS[@]}"; do
+                    if command -v "llvm-bolt-${_bv}" &>/dev/null; then
+                        _rl_ok "Đã có llvm-bolt-${_bv}"
+                        break
+                    fi
+                    apt_install "bolt-${_bv}" &>/dev/null || true
+                    if command -v "llvm-bolt-${_bv}" &>/dev/null; then
+                        _rl_ok "Cài đặt thành công: bolt-${_bv} (llvm-bolt-${_bv})"
+                        break
+                    fi
+                done
+                if [[ -z "$(_bolt_find_tool llvm-bolt 2>/dev/null)" ]]; then
+                    _rl_warn "Không tìm/cài được gói LLVM BOLT (đã thử: ${BOLT_LLVM_VERSIONS[*]}) — BOLT sẽ bị bỏ qua"
+                fi
+            else
+                _rl_ok "LLVM BOLT sẵn có: $(_bolt_find_tool llvm-bolt)"
             fi
-        else
-            _rl_ok "LLVM BOLT sẵn có: $(_bolt_find_tool llvm-bolt)"
         fi
 
         export CC="${CC:-gcc}"
@@ -3598,14 +3602,16 @@ fi
 
 # ════════════════════════════════════════════════════════════════
 #  LLVM BOLT — PER-OS PROFILE SETUP
-#  Tự động kích hoạt ở root mode, phân loại theo Windows OS
+#  Chỉ kích hoạt khi người dùng truyền cờ --llvm-bolt, ở root mode
 # ════════════════════════════════════════════════════════════════
-# Chuẩn bị BOLT context theo Windows OS đã chọn (auto-detect, không cần --bolt)
-_bolt_prepare_context "${win_choice:-5}"
+if [[ "${BOLT_MODE:-0}" == "1" ]]; then
+    # Chuẩn bị BOLT context theo Windows OS đã chọn
+    _bolt_prepare_context "${win_choice:-5}"
 
-# LLVM BOLT chỉ hoạt động ở root mode (có apt), rootless mode tự động bỏ qua
-if [[ "$ROOTLESS" != "1" ]] && [[ "$APT_OK" == "1" ]]; then
-    _bolt_prepare_instrumented "$QEMU_BIN" || true  # non-fatal nếu BOLT không khả dụng
+    # LLVM BOLT chỉ hoạt động ở root mode (có apt), rootless mode tự động bỏ qua
+    if [[ "$ROOTLESS" != "1" ]] && [[ "$APT_OK" == "1" ]]; then
+        _bolt_prepare_instrumented "$QEMU_BIN" || true  # non-fatal nếu BOLT không khả dụng
+    fi
 fi
 
 # Kiểm tra win.img hợp lệ (tồn tại + không phải file rỗng/zero + >= 2GB)
