@@ -541,6 +541,23 @@ _bolt_is_ready() {
     return 1
 }
 
+# _bolt_needs_rebuild_for_relocs <qemu_bin>: trả về 0 (true) khi BOLT đang
+# khả dụng (apt hoặc prebuilt vừa tải) nhưng binary hiện có (từ cache build
+# cũ, ví dụ /opt/qemu-optimized) KHÔNG có relocation sections (.rela.text).
+# Dùng để logic "đã build rồi — bỏ qua build" KHÔNG âm thầm dùng mãi binary
+# cũ thiếu --emit-relocs, khiến BOLT không bao giờ áp dụng được.
+_bolt_needs_rebuild_for_relocs() {
+    local _bin="$1"
+    [[ -x "$_bin" ]] || return 1
+    _bolt_check_tools 2>/dev/null || return 1
+    if [[ -z "${BOLT_PROFILE_KEY:-}" ]]; then
+        _bolt_prepare_context "${win_choice:-5}" 2>/dev/null || true
+    fi
+    _bolt_is_ready && return 1   # đã apply BOLT cho binary này rồi — khỏi rebuild
+    readelf -S "$_bin" 2>/dev/null | grep -q '\.rela\.text\b' && return 1
+    return 0   # BOLT khả dụng, chưa apply, và thiếu relocations → cần rebuild
+}
+
 # _bolt_ensure_runtime_lib: chế độ "-instrument" của llvm-bolt cần link với
 # runtime static lib libbolt_rt_instr.a. Trên nhiều bản Ubuntu/Debian, gói
 # apt cài lib này vào /usr/lib/llvm-<ver>/lib/ (hoặc thư mục target-specific)
@@ -3429,6 +3446,17 @@ fi  # end if choice != n
 
 if [[ "$choice" == "y" ]]; then
 
+    for _bqb in "/opt/qemu-optimized/bin/qemu-system-x86_64" \
+                "$HOME/qemu-optimized/bin/qemu-system-x86_64" \
+                "${QEMU_BIN:-}"; do
+        [[ -n "$_bqb" ]] || continue
+        if _bolt_needs_rebuild_for_relocs "$_bqb"; then
+            echo -e "${Y}⚠${W}  Binary QEMU hiện có (${_bqb}) thiếu relocation sections"
+            echo -e "${B}ℹ${W}  BOLT giờ đã sẵn sàng — build lại với --emit-relocs để BOLT hoạt động"
+            break
+        fi
+    done
+
     if [[ "$ROOTLESS" == "1" ]]; then
         # Bắt đầu tải image nền TRƯỚC khi build để tối đa hoá parallelism
         # (rootless mode dùng AppImage, thường nhanh hơn source build)
@@ -3436,7 +3464,8 @@ if [[ "$choice" == "y" ]]; then
         _start_parallel_download
         [[ -n "$IMG_DL_PID" ]] && echo -e "${B}ℹ${W}  🔀 Tải image song song với rootless AppImage (PID: $IMG_DL_PID)"
         _rootless_build
-    elif [[ -x "/opt/qemu-optimized/bin/qemu-system-x86_64" && "$AUTO_BUILD" != "yes" ]]; then
+    elif [[ -x "/opt/qemu-optimized/bin/qemu-system-x86_64" && "$AUTO_BUILD" != "yes" ]] \
+        && ! _bolt_needs_rebuild_for_relocs "/opt/qemu-optimized/bin/qemu-system-x86_64"; then
         BUILT_VER=$("/opt/qemu-optimized/bin/qemu-system-x86_64" --version 2>/dev/null \
             | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
         echo -e "${G}⚡ QEMU v${BUILT_VER} đã có tại /opt/qemu-optimized — bỏ qua build${W}"
@@ -3444,13 +3473,15 @@ if [[ "$choice" == "y" ]]; then
         export QEMU_BIN="/opt/qemu-optimized/bin/qemu-system-x86_64"
         export PATH="/opt/qemu-optimized/bin:$PATH"
         export LD_LIBRARY_PATH="/opt/qemu-optimized/lib:${LD_LIBRARY_PATH:-}"
-    elif [[ -x "$HOME/qemu-optimized/bin/qemu-system-x86_64" && "$AUTO_BUILD" != "yes" ]]; then
+    elif [[ -x "$HOME/qemu-optimized/bin/qemu-system-x86_64" && "$AUTO_BUILD" != "yes" ]] \
+        && ! _bolt_needs_rebuild_for_relocs "$HOME/qemu-optimized/bin/qemu-system-x86_64"; then
         BUILT_VER=$("$HOME/qemu-optimized/bin/qemu-system-x86_64" --version 2>/dev/null \
             | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
         echo -e "${G}⚡ QEMU v${BUILT_VER} đã có tại ~/qemu-optimized — bỏ qua build${W}"
         export QEMU_BIN="$HOME/qemu-optimized/bin/qemu-system-x86_64"
         export PATH="$HOME/qemu-optimized/bin:$PATH"
-    elif [[ -x "$QEMU_BIN" && "$AUTO_BUILD" != "yes" ]]; then
+    elif [[ -x "$QEMU_BIN" && "$AUTO_BUILD" != "yes" ]] \
+        && ! _bolt_needs_rebuild_for_relocs "$QEMU_BIN"; then
         BUILT_VER=$("$QEMU_BIN" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
         echo -e "${G}⚡ QEMU v${BUILT_VER} đã tồn tại — bỏ qua build${W}"
         export PATH="/opt/qemu-optimized/bin:$PATH"
