@@ -129,7 +129,7 @@ _resolve_qemu_appimage() {
 }
 
 _resolve_qemu_appimage_img() {
-    local _appimage="$1"
+    local _appimage="${1:-}"
     if [[ -z "$_appimage" ]]; then
         _appimage="$(_resolve_qemu_appimage 2>/dev/null || echo '')"
     fi
@@ -1471,6 +1471,7 @@ _start_parallel_download() {
     if ! command -v aria2c &>/dev/null; then
         _ensure_aria2 || true
     fi
+    mkdir -p "$(dirname "${WIN_IMG_PATH:-win.img}")" 2>/dev/null || true
     if command -v aria2c &>/dev/null; then
         nohup aria2c "${ARIA2_OPTS[@]}" \
             --summary-interval=30 \
@@ -1479,9 +1480,19 @@ _start_parallel_download() {
     else
         nohup wget --progress=dot:giga --continue             "$WIN_URL" -O "${WIN_IMG_PATH:-win.img}"             > /tmp/dl-parallel.log 2>&1 &
     fi
-    IMG_DL_PID=$!
-    disown "$IMG_DL_PID" 2>/dev/null || true
-    echo -e "${G}✔${W} Download bắt đầu nền (PID: $IMG_DL_PID)"
+    local _pid=$!
+    disown "$_pid" 2>/dev/null || true
+    # Xác nhận tiến trình còn sống trước khi coi là "đã bắt đầu" —
+    # tránh trường hợp aria2c/wget chết ngay (binary vừa cài, PATH/thư mục
+    # chưa sẵn sàng) khiến bước verify sau này báo sai "download thiếu".
+    sleep 0.4
+    if kill -0 "$_pid" 2>/dev/null; then
+        IMG_DL_PID="$_pid"
+        echo -e "${G}✔${W} Download bắt đầu nền (PID: $IMG_DL_PID)"
+    else
+        IMG_DL_PID=""
+        echo -e "${Y}⚠${W}  Tải nền không khởi động được — sẽ tải tuần tự bình thường sau"
+    fi
 }
 
 # ── Đợi download nền nếu chưa xong ──────────────────────────────
@@ -1503,14 +1514,16 @@ _wait_parallel_download() {
     wait "$IMG_DL_PID" 2>/dev/null || true
     IMG_DL_PID=""
     local _wimg="${WIN_IMG_PATH:-win.img}"
+    local _actual0; _actual0=$(stat -c%s "$_wimg" 2>/dev/null || echo 0)
 
-    # Verify against expected Content-Length nếu có
-    if [[ -n "${WIN_URL:-}" ]]; then
+    # Verify against expected Content-Length nếu có — chỉ cảnh báo khi thực
+    # sự có dữ liệu dở dang (>0 byte); 0 byte nghĩa là tải nền chưa kịp ghi
+    # gì cả, sẽ được tải tuần tự bình thường ở bước sau nên không cần báo.
+    if [[ -n "${WIN_URL:-}" && "$_actual0" -gt 0 ]]; then
         local _expected; _expected=$(_img_expected_size "$WIN_URL" 2>/dev/null || echo 0)
-        local _actual; _actual=$(stat -c%s "$_wimg" 2>/dev/null || echo 0)
-        if [[ "$_expected" -gt 1048576 && "$_actual" -lt "$_expected" ]]; then
-            local _diff=$(( _expected - _actual ))
-            echo -e "${Y}⚠${W}  File nhỏ hơn Content-Length: ${_actual} vs ${_expected} (thiếu ${_diff} bytes) — tải lại"
+        if [[ "$_expected" -gt 1048576 && "$_actual0" -lt "$_expected" ]]; then
+            local _diff=$(( _expected - _actual0 ))
+            echo -e "${Y}⚠${W}  File nhỏ hơn Content-Length: ${_actual0} vs ${_expected} (thiếu ${_diff} bytes) — tải lại"
             rm -f "$_wimg" 2>/dev/null || true
         fi
     fi
@@ -1526,6 +1539,8 @@ _wait_parallel_download() {
         else
             echo -e "${Y}⚠${W}  File nhỏ hơn 2GB (${SZ_BYTES} bytes) — có thể chưa xong: /tmp/dl-parallel.log"
         fi
+    elif [[ "$_actual0" -eq 0 ]]; then
+        : # Tải nền chưa kịp bắt đầu ghi file — im lặng, sequential download sẽ lo tiếp
     else
         echo -e "${Y}⚠${W}  Download chưa hoàn tất — kiểm tra /tmp/dl-parallel.log"
     fi
