@@ -454,6 +454,7 @@ for _arg in "$@"; do
         --iso)         ISO_MODE=1 ;;
         --virtio=*)    ISO_VIRTIO_URL="${_arg#--virtio=}" ;;
         --no-vnc)      WINBOX_VNC=0 ;;
+        --vnc)         WINBOX_VNC=1 ;;
         --help|-h)
             echo "Usage: bash winbox.sh [OPTIONS]"
             echo ""
@@ -477,6 +478,8 @@ for _arg in "$@"; do
             echo "  --resize=+XG    Mở rộng disk image (VM phải đang tắt)
   --safe-download Tải file theo chunks 900MB (cho môi trường giới hạn dung lượng)"
             echo "  --http-img      Dùng QEMU HTTP backend (không tải về)"
+            echo "  --no-vnc        Tắt VNC, chỉ dùng RDP headless (mặc định đã tắt)"
+            echo "  --vnc           Bật VNC :0 (localhost:5900) cùng với RDP"
             echo "  --delete-build  Xoá QEMU AppImage đã tải (opt/home/rootless)"
             echo "  --delete-iso    Xoá toàn bộ ISO cache (~/.cache/winbox-iso)"
             echo "  --iso=URL       Boot từ Windows ISO (cần --virtio=URL cho driver)"
@@ -515,7 +518,7 @@ WINVM_LOG="/tmp/winvm-${INSTANCE_ID}.log"
 WINBOX_DISK_BUS="${WINBOX_DISK_BUS:-ide}"
 WIN_IMG_PATH_BASE="${WIN_IMG_PATH_BASE:-win.img}"
 WINBOX_NET_DEVICE="${WINBOX_NET_DEVICE:-auto}"
-WINBOX_VNC="${WINBOX_VNC:-1}"
+WINBOX_VNC="${WINBOX_VNC:-0}"   # Mặc định TẮT — RDP-only headless. ISO install mode luôn bật VNC riêng. Bật lại bằng --vnc
 
 # ── Helpers: QMP send ────────────────────────────────────────────
 _qmp() {
@@ -3026,8 +3029,8 @@ fi
 # ── Input ────────────────────────────────────────────────────
 
 # ── Display ──────────────────────────────────────────────────
-# VNC luôn bật mặc định (có thể tắt bằng WINBOX_VNC=0)
-if [[ "${WINBOX_VNC:-1}" == "1" ]]; then
+# Mặc định TẮT VNC — RDP-only headless, giảm overhead (bật lại bằng --vnc / WINBOX_VNC=1)
+if [[ "${WINBOX_VNC:-0}" == "1" ]]; then
     if "$QEMU_BIN" -help 2>&1 | grep -qE "^-vnc "; then
         QEMU_CMD+=(-vga virtio -vnc :0)
         echo -e "${G}✔${W} VNC enabled on :5900 (-vnc :0)"
@@ -3037,6 +3040,7 @@ if [[ "${WINBOX_VNC:-1}" == "1" ]]; then
     fi
 else
     QEMU_CMD+=(-vga virtio -display none)
+    echo -e "${G}✔${W} VNC tắt — RDP-only headless (-display none)"
 fi
 
 # ── SMBIOS/config đã được thêm vào QEMU_CMD bên trên ─────────
@@ -3239,10 +3243,15 @@ fi
 echo -e "👤 Username     : ${Y}$RDP_USER${W}"
 echo -e "🔑 Password     : ${Y}$RDP_PASS${W}"
 echo -e "${C}══════════════════════════════════════════════${W}"
-echo "🖥  VNC Server   : ${G}:5900${W} (share=force-shared)"
-echo "   → vncviewer localhost:5900"
-echo "   → noVNC: http://localhost:6080 (nếu có websockify)"
-echo -e "${C}══════════════════════════════════════════════${W}"
-echo -e "${G}🟢 Status       : RUNNING (PID: $QEMU_PID)${W}"
-echo    "⏱  GUI Mode     : VNC + RDP"
+if [[ "${WINBOX_VNC:-0}" == "1" ]]; then
+    echo "🖥  VNC Server   : ${G}:5900${W} (share=force-shared)"
+    echo "   → vncviewer localhost:5900"
+    echo "   → noVNC: http://localhost:6080 (nếu có websockify)"
+    echo -e "${C}══════════════════════════════════════════════${W}"
+    echo -e "${G}🟢 Status       : RUNNING (PID: $QEMU_PID)${W}"
+    echo    "⏱  GUI Mode     : VNC + RDP"
+else
+    echo -e "${G}🟢 Status       : RUNNING (PID: $QEMU_PID)${W}"
+    echo    "⏱  GUI Mode     : RDP only (headless, VNC tắt)"
+fi
 echo -e "${C}══════════════════════════════════════════════${W}"
