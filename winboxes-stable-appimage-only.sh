@@ -1259,6 +1259,7 @@ _rootless_build() {
         local _dest="$1"
         local _ok=0
         local _urls=(
+            "https://github.com/pkgforge-dev/QEMU-AppImage/releases/download/11.1.0-1%402026-08-22_1787393927/QEMU-11.1.0-1-anylinux-x86_64.AppImage"
             "https://archive.org/download/qemu-11-optimize.-app-image/QEMU-11-Optimize.AppImage.tar"
             "https://github.com/pkgforge-dev/QEMU-AppImage/releases/download/11.0.0-1%402026-05-02_1777749420/QEMU-11.0.0-1-anylinux-x86_64.AppImage"
             "https://github.com/lucasmz1/Qemu-AppImage/releases/download/continuous-stable-jammy/QEMU-git-x86_64.AppImage"
@@ -1944,12 +1945,8 @@ _iso_mode_run() {
     else
         echo -e "${Y}⚠${W}  KVM không có — dùng TCG software emulation"
 
-        # ── TCG TB cache ──────────────────────────────────────────
-        local _host_ram_iso; _host_ram_iso=$(awk '/MemTotal/{printf "%.0f",$2/1024/1024}' /proc/meminfo 2>/dev/null || echo 4)
-        [[ "${_host_ram_iso:-0}" -lt 1 ]] && _host_ram_iso=4
-        _tcg_tb_mb=$(( _host_ram_iso * 1024 * 6 / 100 ))
-        [[ "$_tcg_tb_mb" -lt 4096   ]] && _tcg_tb_mb=4096
-        [[ "$_tcg_tb_mb" -gt 8192 ]] && _tcg_tb_mb=8192
+        # ── TCG TB cache (fixed 4096MB) ─────────────────────────────
+        _tcg_tb_mb=4096
         _kvm_accel_args=(-accel "tcg,thread=multi,split-wx=off,one-insn-per-tb=off,tb-size=${_tcg_tb_mb}")
         echo -e "${G}⚡ TCG TB cache: ${_tcg_tb_mb}MB | multi-thread${W}"
 
@@ -2694,13 +2691,8 @@ else
     # Chạy tất cả TCG tuning
     _tcg_tune
 
-    # TCG TB cache — size theo host RAM, tối đa 16384MB (giới hạn QEMU)
-    _host_ram_gb="${mem_total_gb:-$(awk '/MemTotal/{printf "%.0f",$2/1024/1024}' /proc/meminfo)}"
-    [[ "${_host_ram_gb:-0}" -lt 1 ]] && _host_ram_gb=4
-    # Dùng 12% host RAM cho TB cache, floor 4096MB, cap 16384MB
-    TCG_TB_MB=$(( _host_ram_gb * 1024 * 6 / 100 ))
-    [[ "$TCG_TB_MB" -lt 4096  ]] && TCG_TB_MB=4096
-    [[ "$TCG_TB_MB" -gt 8192 ]] && TCG_TB_MB=8192
+    # TCG TB cache — fixed 4096MB
+    TCG_TB_MB=4096
     TCG_ACCEL_OPTS="thread=multi,split-wx=off,one-insn-per-tb=off,tb-size=$TCG_TB_MB"
     echo -e "${G}⚡ TCG TB cache: ${TCG_TB_MB}MB${W}"
     echo -e "${G}⚡ TCG accel: multi-thread + split-wx=off + one-insn-per-tb=off${W}"
@@ -3060,7 +3052,6 @@ if [[ -n "$_APP_BACKEND" && -x "$_APP_BACKEND" ]]; then
     echo -e "🔧 Mode          : ${G}Rootless${W} (no sudo, no apt, no system-wide QEMU)"
     echo -e "🧠 Acceleration   : ${G}TCG available${W} (works without /dev/kvm)"
     echo -e "⚡ Optimization   : ${G}-O3 + LTO baked-in${W} (build-time native CPU optimization)"
-    echo -e "🔗 Linker         : LLVM lld optimized link-time (nếu tương thích)"
     echo -e "📂 Runtime Data   : User-space ($HOME/.local/share/winboxes, $HOME/.cache/winboxes)"
     echo -e "🎯 Fast Math      : Controlled (-ffast-math chỉ áp dụng cho TCG khi phù hợp)"
     echo -e "💾 Firmware/Data  : Bundled in AppDir (BIOS/UEFI/ROM/keymaps/modules)"
