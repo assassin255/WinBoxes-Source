@@ -1260,10 +1260,6 @@ _rootless_build() {
         local _ok=0
         local _urls=(
             "https://github.com/pkgforge-dev/QEMU-AppImage/releases/download/11.1.0-1%402026-08-22_1787393927/QEMU-11.1.0-1-anylinux-x86_64.AppImage"
-            "https://archive.org/download/qemu-11-optimize.-app-image/QEMU-11-Optimize.AppImage.tar"
-            "https://github.com/pkgforge-dev/QEMU-AppImage/releases/download/11.0.0-1%402026-05-02_1777749420/QEMU-11.0.0-1-anylinux-x86_64.AppImage"
-            "https://github.com/lucasmz1/Qemu-AppImage/releases/download/continuous-stable-jammy/QEMU-git-x86_64.AppImage"
-            "https://github.com/lucasmz1/Qemu-AppImage/releases/download/v11-stable/QEMU-11.AppImage"
         )
         mkdir -p "$ROOTLESS_APPIMAGE_DIR" "$ROOTLESS_LOG_DIR"
         for _url in "${_urls[@]}"; do
@@ -3036,7 +3032,7 @@ fi
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo -e "${C}══════════════════════════════════════════════${W}"
-echo -e "${C}🚀 appimage https://github.com/assassin255/WinBoxes-Source/raw/refs/heads/main/QEMU-11-Optimize.AppImage.tar.xz tải thất bạiWINBOXES-STABLE BACKEND STATUS${W}"
+echo -e "${C}🚀 WINBOXES-STABLE BACKEND STATUS${W}"
 echo -e "${C}══════════════════════════════════════════════${W}"
 
 # Resolve QEMU AppImage và kiểm tra thực tế
