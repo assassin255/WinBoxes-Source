@@ -2019,6 +2019,25 @@ _iso_mode_run() {
         )
     fi
 
+    if "$QEMU_BIN" -device help 2>&1 | grep -qi "virtio-rng-pci"; then
+        if [[ -e /dev/urandom ]]; then
+            _launch_cmd+=(-object rng-random,filename=/dev/urandom,id=rng0 -device virtio-rng-pci,rng=rng0)
+        elif [[ -e /dev/random ]]; then
+            _launch_cmd+=(-object rng-random,filename=/dev/random,id=rng0 -device virtio-rng-pci,rng=rng0)
+        fi
+    fi
+
+    # Chia sẻ thư mục host ↔ guest (virtio-9p) — cùng cơ chế với main flow
+    if [[ -n "${WINBOX_SHARE_DIR:-}" && -d "${WINBOX_SHARE_DIR:-}" ]] \
+       && "$QEMU_BIN" -device help 2>&1 | grep -qi "virtio-9p-pci"; then
+        _iso_share_tag="${WINBOX_SHARE_TAG:-hostshare}"
+        _launch_cmd+=(
+            -fsdev local,id=fsdev0,path="$WINBOX_SHARE_DIR",security_model=mapped-xattr
+            -device virtio-9p-pci,fsdev=fsdev0,mount_tag="$_iso_share_tag"
+        )
+        echo -e "${G}✔${W} virtio-9p share: ${WINBOX_SHARE_DIR} → mount_tag=${_iso_share_tag}"
+    fi
+
     _launch_cmd+=(
         -device virtio-gpu-pci
         -device qemu-xhci,id=xhci
@@ -2494,21 +2513,10 @@ _tcg_tune_common() {
             || echo -e "${Y}⚠${W}  oom_score_adj: không ghi được"
     fi
 
-    # taskset: pin QEMU vào số core được cấp phép theo cgroup quota
-    # Không dùng physical core detection (nguy hiểm trong container/vCPU)
+    # taskset CPU pinning đã bị loại bỏ — pin vào ít core theo cgroup quota
+    # từng làm nghẽn thread=multi (worker threads bị ghim chung một dải lõi
+    # hẹp thay vì được scheduler phân tán tự do), khiến VM chạy chậm hơn.
     _TASKSET_PREFIX=""
-    if command -v taskset &>/dev/null; then
-        # cpu_u đã được detect từ cgroup quota ở bước auto-config trước
-        _pin_cores="${cpu_u:-${cpu_core:-$(nproc)}}"
-        [[ "$_pin_cores" -lt 1 ]] && _pin_cores=1
-        # Pin vào 0..(N-1) — đúng với cả bare-metal lẫn container vCPU
-        _pin_range="0-$(( _pin_cores - 1 ))"
-        [[ "$_pin_cores" -eq 1 ]] && _pin_range="0"
-        _TASKSET_PREFIX="taskset -c $_pin_range"
-        echo -e "${G}✔${W} taskset: pin vào ${_pin_cores} vCPU [${_pin_range}] (từ cgroup quota)"
-    else
-        echo -e "${Y}⚠${W}  taskset không có — bỏ qua CPU pinning"
-    fi
     export _TASKSET_PREFIX
 
     # detect numactl
@@ -2956,11 +2964,18 @@ if [[ "${WINBOX_VNC:-0}" == "1" ]]; then
     QEMU_CMD+=(-device nec-usb-xhci -device usb-tablet)
 fi
 
-# ── RNG passthrough (virtio-rng ← /dev/urandom host) ─────────
-# Không cần flag configure riêng (rng-random backend luôn có sẵn trên Linux/POSIX build).
-if [[ -e /dev/urandom ]] && "$QEMU_BIN" -device help 2>&1 | grep -qi "virtio-rng-pci"; then
-    QEMU_CMD+=(-object rng-random,filename=/dev/urandom,id=rng0 -device virtio-rng-pci,rng=rng0)
-    echo -e "${G}✔${W} virtio-rng: passthrough /dev/urandom"
+# ── RNG passthrough (virtio-rng ← /dev/urandom, fallback /dev/random) ──
+# Giảm overhead nhẹ: guest lấy entropy trực tiếp từ host thay vì tự sinh nội bộ.
+if "$QEMU_BIN" -device help 2>&1 | grep -qi "virtio-rng-pci"; then
+    if [[ -e /dev/urandom ]]; then
+        QEMU_CMD+=(-object rng-random,filename=/dev/urandom,id=rng0 -device virtio-rng-pci,rng=rng0)
+        echo -e "${G}✔${W} virtio-rng: passthrough /dev/urandom"
+    elif [[ -e /dev/random ]]; then
+        QEMU_CMD+=(-object rng-random,filename=/dev/random,id=rng0 -device virtio-rng-pci,rng=rng0)
+        echo -e "${G}✔${W} virtio-rng: passthrough /dev/random (fallback)"
+    else
+        echo -e "${Y}⚠${W}  Không tìm thấy /dev/urandom lẫn /dev/random — bỏ qua virtio-rng"
+    fi
 else
     echo -e "${Y}⚠${W}  virtio-rng-pci không khả dụng — bỏ qua"
 fi
