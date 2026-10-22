@@ -1359,7 +1359,14 @@ _rootless_build() {
     echo -e "${C}🔧 ROOTLESS APPIMAGE MODE${W}"
     echo -e "${C}════════════════════════════════════${W}"
 
-    rm -rf "$HOME/python-local" "$HOME/qemu-static" "$HOME/qemu-build" "$HOME/certs"
+    # FIX: KHÔNG rm -rf cả $HOME/qemu-static. Tiến trình nền (aria2c tải Windows
+    # image) có thể đang mở/chạy file trong đó; trên NFS/overlay (JupyterHub) xoá
+    # file đang mở tạo ra .nfsXXXX → rmdir lỗi "Directory not empty" → set -e
+    # làm script chết. Chỉ dọn phần cũ cần thiết và LUÔN nuốt lỗi.
+    rm -rf "$HOME/python-local" "$HOME/qemu-build" "$HOME/certs" 2>/dev/null || true
+    rm -rf "$ROOTLESS_PREFIX/share" "$ROOTLESS_PREFIX/pylib" \
+           "$ROOTLESS_PREFIX/lib" "$ROOTLESS_PREFIX/lib64" 2>/dev/null || true
+    rm -f "$ROOTLESS_BIN_DIR"/qemu-* 2>/dev/null || true
     export PREFIX="$ROOTLESS_PREFIX"
     export BUILD="$HOME/qemu-build"
     mkdir -p "$PREFIX" "$BUILD" "$HOME/certs"
@@ -1625,8 +1632,14 @@ _conda_is_healthy() {
 _ensure_aria2() {
     command -v aria2c &>/dev/null && return 0  # đã có rồi
 
-    local _bin_dir="${PREFIX:-$HOME/qemu-static}/bin"
+    # FIX: đặt aria2c NGOÀI $HOME/qemu-static để không bị xoá/đụng bởi bước
+    # dọn dẹp rootless và không bị khoá file khi đang chạy nền.
+    local _bin_dir="${WB_TOOLS_BIN:-$HOME/.winboxes/bin}"
     mkdir -p "$_bin_dir"
+    if [[ -x "$_bin_dir/aria2c" ]]; then
+        export PATH="$_bin_dir:$PATH"
+        command -v aria2c &>/dev/null && return 0
+    fi
 
     # ── Thử 1: static musl binary (nhanh nhất, ~5s, không cần root) ──
     spin_start "Tải aria2 static binary..."
