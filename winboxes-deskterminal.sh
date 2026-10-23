@@ -1441,32 +1441,61 @@ _rootless_build() {
         done
     }
 
+    _wb_latest_appimage_url() {
+        # Release trên GitHub bị xoay vòng/xoá → URL ghim cứng dễ chết (404).
+        # Hỏi redirect của /releases/latest để lấy tag MỚI NHẤT (không cần API, qua proxy được).
+        local _base="https://github.com/pkgforge-dev/QEMU-AppImage/releases/latest" _loc="" _tag _ver l
+        if command -v curl &>/dev/null; then
+            _loc=$(curl -sI --max-time 20 "$_base" 2>/dev/null || true)
+        elif command -v wget &>/dev/null; then
+            _loc=$(wget -q -S --max-redirect=0 --timeout=20 -O /dev/null "$_base" 2>&1 || true)
+        fi
+        while IFS= read -r l; do
+            l="${l%$'\r'}"; l="${l#"${l%%[![:space:]]*}"}"
+            if [[ "${l,,}" == location:* ]]; then _loc="${l#*: }"; break; fi
+        done <<< "$_loc"
+        [[ "$_loc" == */releases/tag/* ]] || return 0
+        _tag="${_loc##*/releases/tag/}"; _tag="${_tag//%40/@}"
+        _ver="${_tag%%@*}"
+        [[ -n "$_tag" && -n "$_ver" ]] || return 0
+        printf '%s' "https://github.com/pkgforge-dev/QEMU-AppImage/releases/download/${_tag//@/%40}/QEMU-${_ver}-anylinux-x86_64.AppImage"
+        return 0
+    }
+
     _rootless_download_appimage() {
         local _dest="$1"
         local _ok=0
         local _urls=(
             "https://github.com/pkgforge-dev/QEMU-AppImage/releases/download/11.1.1-4%402026-09-26_1790387650/QEMU-11.1.1-4-anylinux-x86_64.AppImage"
         )
+        local _latest_url; _latest_url=$(_wb_latest_appimage_url)
+        if [[ -n "$_latest_url" ]]; then
+            echo -e "${B}ℹ${W}  Release mới nhất: $_latest_url"
+            [[ "$_latest_url" == "${_urls[0]}" ]] || _urls=("$_latest_url" "${_urls[@]}")
+        fi
         mkdir -p "$ROOTLESS_APPIMAGE_DIR" "$ROOTLESS_LOG_DIR"
+        local _dl_log=/tmp/qemu-appimage-download.log _vf_log=/tmp/qemu-appimage-verify.log _tool
+        : > "$_dl_log"; : > "$_vf_log"
         for _url in "${_urls[@]}"; do
             echo -e "${B}ℹ${W}  Thử tải QEMU AppImage: $_url"
-            rm -f "$_dest"
-            if command -v aria2c &>/dev/null; then
-                if aria2c --continue=true --file-allocation=none --check-certificate=false \
-                    --max-tries=5 --retry-wait=3 -x16 -s16 -j1 \
-                    -o "$(basename "$_dest")" -d "$(dirname "$_dest")" \
-                    "$_url" > /tmp/qemu-appimage-download.log 2>&1; then
-                    _ok=1
-                fi
-            elif command -v wget &>/dev/null; then
-                if wget -c --progress=bar:force:noscroll -O "$_dest" "$_url" > /tmp/qemu-appimage-download.log 2>&1; then
-                    _ok=1
-                fi
-            else
-                if curl -fL --retry 5 --retry-delay 3 -o "$_dest" "$_url" > /tmp/qemu-appimage-download.log 2>&1; then
-                    _ok=1
-                fi
-            fi
+            _ok=0
+            # Thử lần lượt aria2c → curl → wget (proxy/egress hay chặn 1 trong 3)
+            for _tool in aria2c curl wget; do
+                command -v "$_tool" &>/dev/null || continue
+                rm -f "$_dest"
+                echo "=== [$_tool] $(date +%T) $_url" >> "$_dl_log"
+                case "$_tool" in
+                    aria2c) aria2c --continue=true --file-allocation=none --check-certificate=false \
+                                --max-tries=5 --retry-wait=3 -x4 -s4 -j1 \
+                                -o "$(basename "$_dest")" -d "$(dirname "$_dest")" \
+                                "$_url" >> "$_dl_log" 2>&1 && _ok=1 ;;
+                    curl)   curl -fL --retry 5 --retry-delay 3 -o "$_dest" "$_url" >> "$_dl_log" 2>&1 && _ok=1 ;;
+                    wget)   wget -c --progress=dot:giga -O "$_dest" "$_url" >> "$_dl_log" 2>&1 && _ok=1 ;;
+                esac
+                if [[ "$_ok" == "1" && -s "$_dest" ]]; then break; fi
+                _ok=0
+                echo -e "${Y}⚠${W}  $_tool tải lỗi — thử công cụ khác"
+            done
             if [[ "$_ok" == "1" ]] && [[ -s "$_dest" ]]; then
                 chmod +x "$_dest" 2>/dev/null || true
                 # Kiểm tra nếu tải được tar.xz
@@ -1474,15 +1503,21 @@ _rootless_build() {
                     local _extracted_dir=$(mktemp -d)
                     tar -xf "$_dest" -C "$_extracted_dir" --strip-components=1
                     chmod +x "$_extracted_dir/AppRun" 2>/dev/null || true
-                    timeout 20 "$_extracted_dir/AppRun" --version >/tmp/qemu-appimage-download.log 2>&1 && \
+                    timeout 20 "$_extracted_dir/AppRun" --version >"$_vf_log" 2>&1 && \
                         cp -r "$_extracted_dir" "$_dest" && rm -rf "$_extracted_dir" && return 0
                     rm -rf "$_extracted_dir"
                 fi
-                timeout 20 "$_dest" --appimage-extract-and-run qemu-system-x86_64 --version >/tmp/qemu-appimage-download.log 2>&1 && return 0
+                timeout 20 "$_dest" --appimage-extract-and-run qemu-system-x86_64 --version >"$_vf_log" 2>&1 && return 0
+                echo -e "${Y}⚠${W}  Tải xong ($(du -h "$_dest" 2>/dev/null | cut -f1)) nhưng AppImage KHÔNG chạy được:"
+                tail -n 6 "$_vf_log" 2>/dev/null || true
                 rm -f "$_dest"
+            else
+                echo -e "${Y}⚠${W}  Không tải được (mọi công cụ đều lỗi). Log cuối:"
+                tail -n 8 "$_dl_log" 2>/dev/null || true
             fi
             rm -f "$_dest"
-            echo -e "${Y}⚠${W}  AppImage tải thất bại: $_url"
+            echo -e "${Y}⚠${W}  AppImage thất bại: $_url"
+            echo -e "${B}ℹ${W}  Xem log:  cat $_dl_log   |   cat $_vf_log"
         done
         return 1
     }
