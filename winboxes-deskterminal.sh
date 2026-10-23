@@ -11,6 +11,154 @@ ORIGINAL_ARGS=("$@")
 ORIGINAL_PWD="$(pwd)"
 
 # ════════════════════════════════════════════════════════════════
+#  MINIMAL-HOST COMPAT LAYER
+#  Chạy được trên Jupyter/sandbox cực tối giản: không lscpu, không nproc,
+#  không awk/grep/sed/tr, /proc/cpuinfo rỗng hoặc bị ẩn, cgroup khác nhau.
+#  Toàn bộ dùng bash builtin; mọi hàm luôn return 0 (an toàn với set -e).
+#  Ép tay khi mọi cách detect đều thất bại:  WB_CPUS=4 WB_RAM_GB=8 bash ...
+# ════════════════════════════════════════════════════════════════
+_wb_read1() {   # đọc dòng đầu của 1 file, im lặng nếu lỗi
+    local v=""
+    if [[ -r "$1" ]]; then { IFS= read -r v < "$1"; } 2>/dev/null || true; fi
+    printf '%s' "$v"
+    return 0
+}
+
+_WB_CPUINFO=""
+if [[ -r /proc/cpuinfo ]]; then
+    { _WB_CPUINFO=$(</proc/cpuinfo); } 2>/dev/null || _WB_CPUINFO=""
+fi
+
+_wb_cpu_field() {   # _wb_cpu_field "model name" → giá trị của dòng đầu tiên
+    local t=$'\n'"$_WB_CPUINFO" key="$1" rest
+    rest="${t#*$'\n'"$key"}"
+    if [[ "$rest" == "$t" ]]; then return 0; fi
+    rest="${rest%%$'\n'*}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    if [[ "$rest" != :* ]]; then return 0; fi
+    rest="${rest#:}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+    printf '%s' "$rest"
+    return 0
+}
+
+_WB_CPU_FLAGS="$(_wb_cpu_field flags)"
+[[ -n "$_WB_CPU_FLAGS" ]] || _WB_CPU_FLAGS="$(_wb_cpu_field Features)"
+
+_wb_cpu_has() { [[ " $_WB_CPU_FLAGS " == *" $1 "* ]]; }   # trả về 1 nếu không có
+
+_wb_clean_model() {   # sanitize tên CPU cho -cpu model-id= (thay tr/sed/cut)
+    local s="$1" c
+    s="${s//,/ }"; s="${s//$'\t'/ }"
+    for c in '"' '\' '@' '#' '$' '%' '^' '&' '*' '|' '<' '>'; do s="${s//"$c"/}"; done
+    while [[ "$s" == *"  "* ]]; do s="${s//  / }"; done
+    s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "${s:0:48}"
+    return 0
+}
+
+_wb_nproc() {   # số CPU: nproc → getconf → /proc/cpuinfo → /sys → python3 → 2
+    local n="" t part a b tot cnt
+    if [[ "${WB_CPUS:-}" =~ ^[1-9][0-9]*$ ]]; then printf '%s' "$WB_CPUS"; return 0; fi
+    if command -v nproc >/dev/null 2>&1; then n=$(nproc 2>/dev/null || true); fi
+    if ! [[ "$n" =~ ^[1-9][0-9]*$ ]]; then n=$(getconf _NPROCESSORS_ONLN 2>/dev/null || true); fi
+    if ! [[ "$n" =~ ^[1-9][0-9]*$ ]] && [[ -n "$_WB_CPUINFO" ]]; then
+        t=$'\n'"$_WB_CPUINFO"
+        a="${t//$'\n'processor/}"
+        cnt=$(( (${#t} - ${#a}) / 10 ))     # ${#"\nprocessor"} = 10
+        n="$cnt"
+    fi
+    if ! [[ "$n" =~ ^[1-9][0-9]*$ ]]; then
+        t=$(_wb_read1 /sys/devices/system/cpu/online); tot=0
+        if [[ "$t" =~ ^[0-9,-]+$ ]]; then
+            local oldifs="$IFS"; IFS=,; local parts=($t); IFS="$oldifs"
+            for part in "${parts[@]}"; do
+                if [[ "$part" == *-* ]]; then a="${part%-*}"; b="${part#*-}"; else a="$part"; b="$part"; fi
+                if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]]; then tot=$(( tot + b - a + 1 )); fi
+            done
+        fi
+        n="$tot"
+    fi
+    if ! [[ "$n" =~ ^[1-9][0-9]*$ ]] && command -v python3 >/dev/null 2>&1; then
+        n=$(python3 -c 'import os;print(len(os.sched_getaffinity(0)))' 2>/dev/null || true)
+    fi
+    if ! [[ "$n" =~ ^[1-9][0-9]*$ ]]; then n=2; fi
+    printf '%s' "$n"
+    return 0
+}
+
+_wb_cgroup_cpus() {   # quota CPU theo cgroup v2/v1 (làm tròn); rỗng nếu không giới hạn
+    local cq="" cp="" v c
+    if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+        v=$(_wb_read1 /sys/fs/cgroup/cpu.max); cq="${v%% *}"; cp="${v##* }"
+    elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]]; then
+        cq=$(_wb_read1 /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+        cp=$(_wb_read1 /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    fi
+    if [[ "$cq" =~ ^[0-9]+$ && "$cp" =~ ^[1-9][0-9]*$ ]]; then
+        c=$(( (cq + cp / 2) / cp ))
+        if [[ $c -lt 1 ]]; then c=1; fi
+        printf '%s' "$c"
+    fi
+    return 0
+}
+
+_wb_mem_gb() {   # RAM (GB, làm tròn) = min(host, cgroup limit); nhiều nguồn dự phòng
+    local kb="" l v lim kb2 pages psz
+    if [[ "${WB_RAM_GB:-}" =~ ^[1-9][0-9]*$ ]]; then printf '%s' "$WB_RAM_GB"; return 0; fi
+    if [[ -r /proc/meminfo ]]; then
+        { while IFS= read -r l; do
+            if [[ "$l" == MemTotal:* ]]; then v="${l#MemTotal:}"; kb="${v//[!0-9]/}"; break; fi
+        done < /proc/meminfo; } 2>/dev/null || true
+    fi
+    if ! [[ "$kb" =~ ^[1-9][0-9]*$ ]]; then
+        pages=$(getconf _PHYS_PAGES 2>/dev/null || true); psz=$(getconf PAGESIZE 2>/dev/null || true)
+        if [[ "$pages" =~ ^[0-9]+$ && "$psz" =~ ^[0-9]+$ ]]; then kb=$(( pages * (psz / 1024) )); fi
+    fi
+    if ! [[ "$kb" =~ ^[1-9][0-9]*$ ]] && command -v python3 >/dev/null 2>&1; then
+        kb=$(python3 -c 'import os;print(os.sysconf("SC_PHYS_PAGES")*os.sysconf("SC_PAGE_SIZE")//1024)' 2>/dev/null || true)
+    fi
+    for lim in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+        v=$(_wb_read1 "$lim")
+        if [[ "$v" =~ ^[0-9]+$ && ${#v} -le 15 ]]; then
+            kb2=$(( v / 1024 ))
+            if [[ ! "$kb" =~ ^[1-9][0-9]*$ || $kb2 -lt $kb ]]; then kb="$kb2"; fi
+            break
+        fi
+    done
+    if ! [[ "$kb" =~ ^[1-9][0-9]*$ ]]; then printf '%s' 4; return 0; fi
+    v=$(( (kb + 524288) / 1048576 ))
+    if [[ $v -lt 1 ]]; then v=1; fi
+    printf '%s' "$v"
+    return 0
+}
+
+_wb_pin_range() {   # N core ĐƯỢC PHÉP đầu tiên (cpuset có thể là 8-11, không phải 0-3)
+    local n="$1" l="" line out="" cnt=0 part a b i
+    [[ "$n" =~ ^[1-9][0-9]*$ ]] || n=1
+    if [[ -r /proc/self/status ]]; then
+        { while IFS= read -r line; do
+            if [[ "$line" == Cpus_allowed_list:* ]]; then l="${line#Cpus_allowed_list:}"; l="${l//[[:space:]]/}"; break; fi
+        done < /proc/self/status; } 2>/dev/null || true
+    fi
+    if [[ -n "$l" && "$l" =~ ^[0-9,-]+$ ]]; then
+        local oldifs="$IFS"; IFS=,; local parts=($l); IFS="$oldifs"
+        for part in "${parts[@]}"; do
+            if [[ "$part" == *-* ]]; then a="${part%-*}"; b="${part#*-}"; else a="$part"; b="$part"; fi
+            if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]]; then
+                for (( i=a; i<=b && cnt<n; i++ )); do out+="${out:+,}$i"; cnt=$(( cnt + 1 )); done
+            fi
+            if [[ $cnt -ge $n ]]; then break; fi
+        done
+    fi
+    if [[ -z "$out" ]]; then
+        if [[ "$n" -eq 1 ]]; then out="0"; else out="0-$(( n - 1 ))"; fi
+    fi
+    printf '%s' "$out"
+    return 0
+}
+
+# ════════════════════════════════════════════════════════════════
 #  WINBOX
 #  QEMU: luôn dùng AppImage prebuilt tối ưu (-O3/LTO/native), cho CẢ
 #  root lẫn rootless mode — không còn build QEMU từ source.
@@ -1194,7 +1342,7 @@ _detect_kvm() {
     # Bước 4: thử chạy kvm-ok hoặc kiểm tra /proc/cpuinfo flags
     if [[ $CAN_USE_KVM -eq 1 ]]; then
         # Kiểm tra CPU có vmx/svm flag không
-        if grep -qE '(vmx|svm)' /proc/cpuinfo 2>/dev/null; then
+        if _wb_cpu_has vmx || _wb_cpu_has svm; then
             echo -e "${G}✔${W}  CPU có hỗ trợ hardware virtualization (vmx/svm)"
             KVM_AVAILABLE=1
             KVM_MODE="kvm"
@@ -1702,7 +1850,7 @@ _ensure_aria2() {
 
             if (cd "$_src_dir" && \
                 ./configure "${_cfg_flags[@]}" > /tmp/aria2-cfg-$$.log 2>&1 && \
-                make -j"$(nproc)" > /tmp/aria2-make-$$.log 2>&1 && \
+                make -j"$(_wb_nproc)" > /tmp/aria2-make-$$.log 2>&1 && \
                 make install > /dev/null 2>&1); then
                 rm -rf "$_src_dir" /tmp/aria2-cfg-$$.log /tmp/aria2-make-$$.log
                 export PATH="$_bin_dir:$PATH"
@@ -2586,8 +2734,8 @@ _iso_mode_run() {
     local _disk_gb="60"
     local _cpu_cores="2"
     local _ram_gb="4"
-    local _host_cores; _host_cores=$(nproc 2>/dev/null || echo 4)
-    local _host_ram_gb; _host_ram_gb=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 8)
+    local _host_cores; _host_cores=$(_wb_nproc)
+    local _host_ram_gb; _host_ram_gb=$(_wb_mem_gb)
     echo ""
 
     if [[ -f "$_iso_dir/win.img" ]]; then
@@ -2685,18 +2833,18 @@ _iso_mode_run() {
 
         # ── CPU model-id (giống normal mode) ─────────────────────
         local _raw_cpu_name _cpu_vendor _cpu_name_useful _stripped
-        _raw_cpu_name=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | sed 's/^.*: //' || echo "")
-        _cpu_vendor=$(grep -m1 "vendor_id"  /proc/cpuinfo 2>/dev/null | awk '{print $NF}' || echo "")
+        _raw_cpu_name=$(_wb_cpu_field "model name")
+        _cpu_vendor=$(_wb_cpu_field vendor_id)
         _cpu_name_useful=0
-        _stripped=$(printf '%s' "$_raw_cpu_name" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+        _stripped="${_raw_cpu_name//[[:space:]]/}"; _stripped="${_stripped,,}"
         if [[ -n "$_stripped" && "$_stripped" != "unknown" && ${#_stripped} -ge 4 ]]; then
-            printf '%s' "$_stripped" | grep -q '[a-z]' && _cpu_name_useful=1
+            [[ "$_stripped" =~ [a-z] ]] && _cpu_name_useful=1
         fi
 
         local _cpu_host _cpu_model_id _cpu_extra
         if [[ "$_cpu_name_useful" == "1" ]]; then
             _cpu_host="$_raw_cpu_name"
-            _cpu_model_id=$(printf '%s' "$_cpu_host"                 | tr ',' ' '                 | tr -d '"\@#$%^&*|<>'                 | sed 's/[[:space:]]\+/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//'                 | cut -c1-48)
+            _cpu_model_id=$(_wb_clean_model "$_cpu_host")
         else
             case "$_cpu_vendor" in
                 GenuineIntel) _cpu_host="Intel Xeon Gold 6254" ;;
@@ -2709,12 +2857,12 @@ _iso_mode_run() {
             echo -e "${Y}⚠${W}  CPU name không đọc được — dùng fallback: ${_cpu_model_id}"
         fi
         _cpu_extra=
-        grep -q ssse3  /proc/cpuinfo && _cpu_extra="${_cpu_extra},+ssse3"
-        grep -q sse4_1 /proc/cpuinfo && _cpu_extra="${_cpu_extra},+sse4.1"
-        grep -q sse4_2 /proc/cpuinfo && _cpu_extra="${_cpu_extra},+sse4.2"
-        grep -q rdtscp /proc/cpuinfo && _cpu_extra="${_cpu_extra},+rdtscp"
-        grep -q ' avx ' /proc/cpuinfo && _cpu_extra="${_cpu_extra},+avx"
-        grep -q avx2   /proc/cpuinfo && _cpu_extra="${_cpu_extra},+avx2"
+        _wb_cpu_has ssse3 && _cpu_extra="$_cpu_extra,+ssse3"
+        _wb_cpu_has sse4_1 && _cpu_extra="$_cpu_extra,+sse4.1"
+        _wb_cpu_has sse4_2 && _cpu_extra="$_cpu_extra,+sse4.2"
+        _wb_cpu_has rdtscp && _cpu_extra="$_cpu_extra,+rdtscp"
+        _wb_cpu_has avx && _cpu_extra="$_cpu_extra,+avx"
+        _wb_cpu_has avx2 && _cpu_extra="$_cpu_extra,+avx2"
         _cpu_val="qemu64,hypervisor=off,tsc=on,pmu=off,l3-cache=on,+cmov,+mmx,+fxsr,+sse2,+cx16,+x2apic,+sep,+pat,+pse,+aes,+popcnt,-tsc-deadline${_cpu_extra},model-id=${_cpu_model_id}"
         echo -e "${G}✔${W}  CPU model: ${_cpu_host}  |  flags:${_cpu_extra:-none}"
     fi
@@ -3182,20 +3330,17 @@ fi
 
 if [[ "$cfg_mode" == "1" ]]; then
     spin_start "Auto detect tài nguyên host..."
-    cpu_v=$(nproc 2>/dev/null); cpu_u=$cpu_v
+    cpu_v=$(_wb_nproc); cpu_u=$cpu_v
 
-    if [[ -f /sys/fs/cgroup/cpu.max ]]; then
-        IFS=" " read -r cq cp < /sys/fs/cgroup/cpu.max
-        [[ "$cq" != "max" ]] && cpu_u=$(awk "BEGIN{printf \"%.0f\",$cq/$cp}")
-    elif [[ -f /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]]; then
-        cq=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
-        cp=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
-        [[ "$cq" != "-1" ]] && cpu_u=$(awk "BEGIN{printf \"%.0f\",$cq/$cp}")
+    _wb_q=$(_wb_cgroup_cpus)
+    if [[ -n "$_wb_q" ]]; then
+        cpu_u=$_wb_q
+        if [[ "$cpu_u" -gt "$cpu_v" ]]; then cpu_u=$cpu_v; fi
     fi
     [[ "$cpu_u" -lt 1 ]] && cpu_u=1
 
-    mem_total_gb=$(awk '/MemTotal/{printf "%.0f",$2/1024/1024}' /proc/meminfo)
-    mem_auto_gb=$(awk "BEGIN{printf \"%d\", ($mem_total_gb*0.70)+0.5}")
+    mem_total_gb=$(_wb_mem_gb)
+    mem_auto_gb=$(( (mem_total_gb * 70 + 50) / 100 ))
     [[ "$mem_auto_gb" -lt 2 ]] && mem_auto_gb=2
     max_ram=$(( mem_total_gb - 1 ))
     [[ "$mem_auto_gb" -gt "$max_ram" ]] && mem_auto_gb=$max_ram
@@ -3251,12 +3396,14 @@ _tcg_tune_common() {
     _TASKSET_PREFIX=""
     if command -v taskset &>/dev/null; then
         # cpu_u đã được detect từ cgroup quota ở bước auto-config trước
-        _pin_cores="${cpu_u:-${cpu_core:-$(nproc)}}"
+        _pin_cores="${cpu_u:-${cpu_core:-$(_wb_nproc)}}"
         [[ "$_pin_cores" -lt 1 ]] && _pin_cores=1
         # Pin vào 0..(N-1) — đúng với cả bare-metal lẫn container vCPU
-        _pin_range="0-$(( _pin_cores - 1 ))"
-        [[ "$_pin_cores" -eq 1 ]] && _pin_range="0"
+        _pin_range=$(_wb_pin_range "$_pin_cores")
         _TASKSET_PREFIX="taskset -c $_pin_range"
+        if ! taskset -c "$_pin_range" true 2>/dev/null; then
+            _TASKSET_PREFIX=""   # seccomp/cpuset chặn taskset → bỏ pin, không làm VM chết
+        fi
         echo -e "${G}✔${W} taskset: pin vào ${_pin_cores} vCPU [${_pin_range}] (từ cgroup quota)"
     else
         echo -e "${Y}⚠${W}  taskset không có — bỏ qua CPU pinning"
@@ -3343,7 +3490,7 @@ _tcg_tune_root() {
 
 # ── stress-ng warmup — chạy được cả root lẫn rootless ───────────
 _stress_warmup() {
-    local _ncpu="${1:-$(nproc)}"
+    local _ncpu="${1:-$(_wb_nproc)}"
     local _dur=8
     if command -v stress-ng &>/dev/null; then
         echo -e "${B}ℹ${W}  stress-ng warmup: ${_ncpu} CPU × ${_dur}s..."
@@ -3377,7 +3524,7 @@ _tcg_tune() {
     if [[ $EUID -eq 0 ]]; then
         _tcg_tune_root
     fi
-    _stress_warmup "${cpu_core:-$(nproc)}"
+    _stress_warmup "${cpu_core:-$(_wb_nproc)}"
     LAUNCH_PREFIX="${_TASKSET_PREFIX:+${_TASKSET_PREFIX} }${TCG_NUMACTL_PREFIX:+${TCG_NUMACTL_PREFIX} }${TCG_CHRT_PREFIX:-}"
     LAUNCH_PREFIX="${LAUNCH_PREFIX# }"
     export LAUNCH_PREFIX
@@ -3471,16 +3618,16 @@ else
     #   1. model name từ /proc/cpuinfo (nếu không phải "unknown"/rỗng)
     #   2. vendor_id + family/model number → tên hợp lý
     #   3. Hardcode fallback theo vendor
-    _raw_cpu_name=$(grep -m1 "model name" /proc/cpuinfo 2>/dev/null | sed 's/^.*: //' || echo "")
-    _cpu_vendor=$(grep -m1 "vendor_id"  /proc/cpuinfo 2>/dev/null | awk '{print $NF}' || echo "")
+    _raw_cpu_name=$(_wb_cpu_field "model name")
+    _cpu_vendor=$(_wb_cpu_field vendor_id)
 
     # Kiểm tra tên có thực sự hữu ích không
     # Các giá trị vô nghĩa thường gặp trên container/VPS: "unknown", trống, chỉ toàn số/ký tự đặc biệt
     _cpu_name_useful=0
-    _stripped=$(printf '%s' "$_raw_cpu_name" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    _stripped="${_raw_cpu_name//[[:space:]]/}"; _stripped="${_stripped,,}"
     if [[ -n "$_stripped" && "$_stripped" != "unknown" && ${#_stripped} -ge 4 ]]; then
         # Phải có ít nhất 1 chữ cái (không phải toàn số/ký hiệu)
-        if printf '%s' "$_stripped" | grep -q '[a-z]'; then
+        if [[ "$_stripped" =~ [a-z] ]]; then
             _cpu_name_useful=1
         fi
     fi
@@ -3488,11 +3635,7 @@ else
     if [[ "$_cpu_name_useful" == "1" ]]; then
         # Dùng tên thật — sanitize để QEMU chấp nhận
         cpu_host="$_raw_cpu_name"
-        cpu_model_id=$(printf '%s' "$cpu_host" \
-            | tr ',' ' ' \
-            | tr -d '"\\@#$%^&*|<>' \
-            | sed 's/[[:space:]]\+/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//' \
-            | cut -c1-48)
+        cpu_model_id=$(_wb_clean_model "$cpu_host")
     else
         # Tên không dùng được — fallback theo vendor_id
         case "$_cpu_vendor" in
@@ -3506,12 +3649,12 @@ else
         echo -e "${Y}⚠${W}  CPU name không đọc được ('${_raw_cpu_name:-empty}') — dùng fallback: ${cpu_model_id}"
     fi
     CPU_EXTRA=
-    grep -q ssse3  /proc/cpuinfo && CPU_EXTRA="$CPU_EXTRA,+ssse3"
-    grep -q sse4_1 /proc/cpuinfo && CPU_EXTRA="$CPU_EXTRA,+sse4.1"
-    grep -q sse4_2 /proc/cpuinfo && CPU_EXTRA="$CPU_EXTRA,+sse4.2"
-    grep -q rdtscp /proc/cpuinfo && CPU_EXTRA="$CPU_EXTRA,+rdtscp"
-    grep -q ' avx ' /proc/cpuinfo && CPU_EXTRA="$CPU_EXTRA,+avx"
-    grep -q avx2   /proc/cpuinfo && CPU_EXTRA="$CPU_EXTRA,+avx2"
+    _wb_cpu_has ssse3 && CPU_EXTRA="$CPU_EXTRA,+ssse3"
+    _wb_cpu_has sse4_1 && CPU_EXTRA="$CPU_EXTRA,+sse4.1"
+    _wb_cpu_has sse4_2 && CPU_EXTRA="$CPU_EXTRA,+sse4.2"
+    _wb_cpu_has rdtscp && CPU_EXTRA="$CPU_EXTRA,+rdtscp"
+    _wb_cpu_has avx && CPU_EXTRA="$CPU_EXTRA,+avx"
+    _wb_cpu_has avx2 && CPU_EXTRA="$CPU_EXTRA,+avx2"
     # qemu64: baseline an toàn, chỉ expose đúng flags host có — tránh emulate thừa
     # -tsc-deadline: tắt TSC-deadline timer trap overhead trong TCG
     cpu_model="max,hypervisor=off,tsc=on,pmu=off,l3-cache=on,+cmov,+mmx,+fxsr,+sse2,+cx16,+x2apic,+sep,+pat,+pse,+aes,+popcnt,-tsc-deadline${CPU_EXTRA},model-id=${cpu_model_id}"
