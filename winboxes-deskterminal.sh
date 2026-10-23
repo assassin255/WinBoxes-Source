@@ -1435,10 +1435,65 @@ _rootless_build() {
         mkdir -p "$_bin_dir"
         local _cmd
         for _cmd in qemu-system-x86_64 qemu-img qemu-nbd qemu-io qemu-storage-daemon; do
-            printf '#!/bin/sh\nexec "%s" --appimage-extract-and-run "%s" "$@"\n' \
-                "$_appimage" "$_cmd" > "$_bin_dir/$_cmd"
+            case "${_WB_APPIMAGE_MODE:-extract-and-run}" in
+                extracted)   # đã giải nén 1 lần → chạy thẳng, không giải nén lại mỗi lần launch
+                    printf '#!/bin/sh\nexec "%s/AppRun" "%s" "$@"\n' \
+                        "$_WB_APPIMAGE_ROOT" "$_cmd" > "$_bin_dir/$_cmd" ;;
+                direct)      # FUSE mount
+                    printf '#!/bin/sh\nexec "%s" "%s" "$@"\n' \
+                        "$_appimage" "$_cmd" > "$_bin_dir/$_cmd" ;;
+                *)           # extract-and-run, TMPDIR riêng (tránh /tmp nhỏ/noexec)
+                    printf '#!/bin/sh\nTMPDIR="%s"; export TMPDIR\nmkdir -p "$TMPDIR"\nexec "%s" --appimage-extract-and-run "%s" "$@"\n' \
+                        "${_WB_APPIMAGE_TMP:-/tmp}" "$_appimage" "$_cmd" > "$_bin_dir/$_cmd" ;;
+            esac
             chmod +x "$_bin_dir/$_cmd"
         done
+    }
+
+    _wb_timeout() { local _t="$1"; shift; if command -v timeout &>/dev/null; then timeout "$_t" "$@"; else "$@"; fi; }
+
+    _rootless_prepare_appimage() {
+        # Chạy THẲNG trên file đã tải (KHÔNG tải lại). Thử lần lượt các chiến lược;
+        # cái đầu tiên chạy được quyết định cách tạo wrapper. Mọi bước ghi vào $2.
+        local _app="$1" _log="$2" _dir _root _tmp _rc
+        _dir="$(dirname "$_app")"; _root="$_dir/squashfs-root"; _tmp="$_dir/tmp"
+        mkdir -p "$_tmp"
+        {
+            echo "=== file:  $(ls -l "$_app" 2>&1)"
+            echo "=== magic: $(head -c 4 "$_app" 2>/dev/null | od -An -c 2>/dev/null)"
+            echo "=== fs:    $(df -T "$_dir" 2>&1 | tail -n 1)"
+            echo "=== user:  $(id -u 2>/dev/null)  fuse: $([[ -e /dev/fuse ]] && echo yes || echo no)"
+        } > "$_log" 2>&1 || true
+        _WB_APPIMAGE_MODE=""; _WB_APPIMAGE_ROOT="$_root"; _WB_APPIMAGE_TMP="$_tmp"
+
+        # S1: giải nén 1 lần vào ổ đĩa, rồi chạy thẳng AppRun (nhanh nhất, không phụ thuộc FUSE/timeout)
+        echo -e "${B}ℹ${W}  Giải nén AppImage 1 lần (có thể mất vài chục giây)..."
+        echo "### S1: --appimage-extract" >> "$_log"
+        rm -rf "$_root"; _rc=0
+        ( cd "$_dir" && _wb_timeout 900 "$_app" --appimage-extract >> "$_log" 2>&1 ) || _rc=$?
+        echo "### S1 extract exit=$_rc" >> "$_log"
+        if [[ -f "$_root/AppRun" ]]; then
+            chmod +x "$_root/AppRun" 2>/dev/null || true
+            if _wb_timeout 120 "$_root/AppRun" qemu-system-x86_64 --version >> "$_log" 2>&1; then
+                _WB_APPIMAGE_MODE="extracted"; return 0
+            fi
+            echo "### S1 run FAILED" >> "$_log"
+        fi
+
+        # S2: extract-and-run, timeout dài, TMPDIR trên ổ đĩa
+        echo "### S2: --appimage-extract-and-run (TMPDIR=$_tmp)" >> "$_log"
+        if ( export TMPDIR="$_tmp"; _wb_timeout 900 "$_app" --appimage-extract-and-run qemu-system-x86_64 --version >> "$_log" 2>&1 ); then
+            _WB_APPIMAGE_MODE="extract-and-run"; return 0
+        fi
+        echo "### S2 FAILED" >> "$_log"
+
+        # S3: chạy trực tiếp (FUSE mount)
+        echo "### S3: direct" >> "$_log"
+        if _wb_timeout 120 "$_app" qemu-system-x86_64 --version >> "$_log" 2>&1; then
+            _WB_APPIMAGE_MODE="direct"; return 0
+        fi
+        echo "### S3 FAILED" >> "$_log"
+        return 1
     }
 
     _wb_latest_appimage_url() {
@@ -1492,32 +1547,31 @@ _rootless_build() {
                     curl)   curl -fL --retry 5 --retry-delay 3 -o "$_dest" "$_url" >> "$_dl_log" 2>&1 && _ok=1 ;;
                     wget)   wget -c --progress=dot:giga -O "$_dest" "$_url" >> "$_dl_log" 2>&1 && _ok=1 ;;
                 esac
-                if [[ "$_ok" == "1" && -s "$_dest" ]]; then break; fi
+                if [[ "$_ok" == "1" ]]; then
+                    _sz=$(stat -c%s "$_dest" 2>/dev/null || echo 0)
+                    if [[ "$_sz" =~ ^[0-9]+$ && "$_sz" -ge 30000000 ]]; then break; fi
+                    echo "=== [$_tool] file quá nhỏ (${_sz}B) — có thể là trang lỗi/proxy" >> "$_dl_log"
+                fi
                 _ok=0
                 echo -e "${Y}⚠${W}  $_tool tải lỗi — thử công cụ khác"
             done
             if [[ "$_ok" == "1" ]] && [[ -s "$_dest" ]]; then
                 chmod +x "$_dest" 2>/dev/null || true
-                # Kiểm tra nếu tải được tar.xz
-                if [[ "$_dest" == *.tar ]] && command -v tar &>/dev/null; then
-                    local _extracted_dir=$(mktemp -d)
-                    tar -xf "$_dest" -C "$_extracted_dir" --strip-components=1
-                    chmod +x "$_extracted_dir/AppRun" 2>/dev/null || true
-                    timeout 20 "$_extracted_dir/AppRun" --version >"$_vf_log" 2>&1 && \
-                        cp -r "$_extracted_dir" "$_dest" && rm -rf "$_extracted_dir" && return 0
-                    rm -rf "$_extracted_dir"
+                echo -e "${G}✔${W}  Đã tải xong ($(du -h "$_dest" 2>/dev/null | cut -f1)) — chuẩn bị chạy, KHÔNG tải lại"
+                if _rootless_prepare_appimage "$_dest" "$_vf_log"; then
+                    echo -e "${G}✔${W}  AppImage sẵn sàng (chế độ: ${_WB_APPIMAGE_MODE})"
+                    return 0
                 fi
-                timeout 20 "$_dest" --appimage-extract-and-run qemu-system-x86_64 --version >"$_vf_log" 2>&1 && return 0
-                echo -e "${Y}⚠${W}  Tải xong ($(du -h "$_dest" 2>/dev/null | cut -f1)) nhưng AppImage KHÔNG chạy được:"
-                tail -n 6 "$_vf_log" 2>/dev/null || true
-                rm -f "$_dest"
-            else
-                echo -e "${Y}⚠${W}  Không tải được (mọi công cụ đều lỗi). Log cuối:"
-                tail -n 8 "$_dl_log" 2>/dev/null || true
+                echo -e "${R}✘${W}  Đã tải xong nhưng AppImage không chạy được ở cả 3 chế độ. Log cuối:"
+                tail -n 15 "$_vf_log" 2>/dev/null || true
+                echo -e "${B}ℹ${W}  File giữ lại: $_dest   |   cat $_vf_log"
+                return 1   # lỗi nằm ở môi trường chạy, tải lại cũng không giúp ích
             fi
+            echo -e "${Y}⚠${W}  Không tải được (mọi công cụ đều lỗi). Log cuối:"
+            tail -n 8 "$_dl_log" 2>/dev/null || true
             rm -f "$_dest"
-            echo -e "${Y}⚠${W}  AppImage thất bại: $_url"
-            echo -e "${B}ℹ${W}  Xem log:  cat $_dl_log   |   cat $_vf_log"
+            echo -e "${Y}⚠${W}  Tải thất bại: $_url"
+            echo -e "${B}ℹ${W}  Xem log:  cat $_dl_log"
         done
         return 1
     }
@@ -1568,7 +1622,7 @@ _rootless_build() {
     fi
 
     if ! _rootless_download_appimage "$ROOTLESS_APPIMAGE"; then
-        echo -e "${R}✘${W}  Không tải được QEMU AppImage"
+        echo -e "${R}✘${W}  Không chuẩn bị được QEMU AppImage (xem log phía trên)"
         echo -e "${Y}💡${W}  Hãy thử lại khi mạng ổn hơn, hoặc dùng --no-build để bỏ qua mode này"
         exit 1
     fi
@@ -4060,7 +4114,7 @@ QEMU_CMD[0]="$QEMU_BIN"
 # Nếu QEMU_BIN là AppImage, đảm bảo AppRun và paths đúng
 if [[ "$QEMU_BIN" == *"AppImage"* ]] || [[ -x "$QEMU_BIN" ]]; then
     # Kiểm tra AppImage có thể chạy --version
-    if ! timeout 10 "$QEMU_BIN" --version >/dev/null 2>&1; then
+    if ! timeout 120 "$QEMU_BIN" --version >/dev/null 2>&1; then
         echo -e "${R}✘${W} AppImage không chạy được (--version thất bại): $QEMU_BIN"
         echo -e "${Y}💡${W} Thử: $QEMU_BIN --appimage-extract-and-run qemu-system-x86_64 --version"
     else
